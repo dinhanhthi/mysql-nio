@@ -11,6 +11,7 @@ public final class MySQLConnection: MySQLDatabase, Sendable {
         password: String? = nil,
         tlsConfiguration: TLSConfiguration? = .makeClientConfiguration(),
         serverHostname: String? = nil,
+        allowPublicKeyRetrieval: Bool = false,
         logger: Logger = .init(label: "codes.vapor.mysql"),
         on eventLoop: any EventLoop
     ) -> EventLoopFuture<MySQLConnection> {
@@ -41,6 +42,7 @@ public final class MySQLConnection: MySQLDatabase, Sendable {
                         password: password,
                         tlsConfiguration: tlsConfiguration,
                         serverHostname: serverHostname,
+                        allowPublicKeyRetrieval: allowPublicKeyRetrieval,
                         done: done
                     )), sequence: sequence),
                     ErrorHandler()

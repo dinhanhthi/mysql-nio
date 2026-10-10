@@ -85,12 +85,13 @@ There are a few ways to create a `SocketAddress`:
 - `init(unixDomainSocketPath: String)`
 - `makeAddressResolvingHost(_ host: String, port: Int)`
 
-There are also some additional arguments you can supply to ``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:logger:on:)``. 
+There are also some additional arguments you can supply to ``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:allowPublicKeyRetrieval:logger:on:)``. 
 
 - `tlsConfiguration` An optional `TLSConfiguration` struct. This will be used if the MySQL server supports TLS. Pass `nil` to opt-out of TLS.
 - `serverHostname` An optional `String` to use in conjunction with `tlsConfiguration` to specify the server's hostname. 
+- `allowPublicKeyRetrieval` Defaults to `false`. Lets `caching_sha2_password` fetch the server's RSA public key over a connection without TLS (needed for full authentication without TLS). The key is not authenticated, so only enable this on trusted networks.
 
-``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:logger:on:)`` will return a ``MySQLConnection``, or an error if it could not connect.
+``MySQLConnection/connect(to:username:database:password:tlsConfiguration:serverHostname:allowPublicKeyRetrieval:logger:on:)`` will return a ``MySQLConnection``, or an error if it could not connect.
 
 ### Database Protocol
 

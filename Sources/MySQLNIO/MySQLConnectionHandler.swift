@@ -18,6 +18,8 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         case handshake(HandshakeState)
         case authenticating(AuthenticationState)
         case commandPhase
+        /// The connect promise has failed; the channel is closing.
+        case loginFailed
     }
     
     struct HandshakeState {
@@ -26,6 +28,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         let password: String?
         let tlsConfiguration: TLSConfiguration?
         let serverHostname: String?
+        let allowPublicKeyRetrieval: Bool
         let done: EventLoopPromise<Void>
     }
     
@@ -35,6 +38,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         var isTLS: Bool
         var savedSeedValue: [UInt8]
         var awaitingCachingSha2PluginPublicKey: Bool
+        var allowPublicKeyRetrieval: Bool
         var done: EventLoopPromise<Void>
     }
     
@@ -66,15 +70,17 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
                 self.logger.trace("Handle handshake packet")
                 try self.handleHandshake(context: context, packet: &packet, state: state)
             } catch {
-                state.done.fail(error)
+                self.failLogin(error)
             }
         case .authenticating(let state):
             do {
                 self.logger.trace("Handle authentication packet")
                 try self.handleAuthentication(context: context, packet: &packet, state: state)
             } catch {
-                state.done.fail(error)
+                self.failLogin(error)
             }
+        case .loginFailed:
+            break // the login already failed; the channel is closing
         case .commandPhase:
             if let current = self.queue.first {
                 do {
@@ -137,7 +143,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
                 try context.channel.pipeline.syncOperations.addHandler(handler, position: .first)
                 try self.writeHandshakeResponse(context: context, handshakeRequest: handshakeRequest, state: state, isTLS: true)
             }.whenFailure { error in
-                state.done.fail(error)
+                self.failLogin(error)
             }
         } else {
             try self.writeHandshakeResponse(context: context, handshakeRequest: handshakeRequest, state: state, isTLS: false)
@@ -149,6 +155,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         isTLS: Bool,
         passwordInput: String?,
         authPluginData: ByteBuffer,
+        allowPublicKeyRetrieval: Bool,
         done: EventLoopPromise<Void>
     ) throws -> ByteBuffer {
         var password = ByteBufferAllocator().buffer(capacity: 0)
@@ -193,6 +200,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
             isTLS: isTLS,
             savedSeedValue: saveSeed,
             awaitingCachingSha2PluginPublicKey: false,
+            allowPublicKeyRetrieval: allowPublicKeyRetrieval,
             done: done
         ))
         return hash
@@ -244,7 +252,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
             throw MySQLError.unsupportedAuthPlugin(name: "<none>")
         }
 
-        let hash = try doInitialAuthPluginHandling(authPluginName: authPluginName, isTLS: isTLS, passwordInput: state.password, authPluginData: handshakeRequest.authPluginData, done: state.done)
+        let hash = try doInitialAuthPluginHandling(authPluginName: authPluginName, isTLS: isTLS, passwordInput: state.password, authPluginData: handshakeRequest.authPluginData, allowPublicKeyRetrieval: state.allowPublicKeyRetrieval, done: state.done)
 
         let res = MySQLPacket.HandshakeResponse41(
             capabilities: .clientDefault,
@@ -275,7 +283,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         guard let newAuthData = packet.payload.readSlice(length: 20) else { // WARNING: This might be wrong for plugins we don't yet support...
             throw MySQLError.missingAuthPluginInlineData
         }
-        let newHash = try doInitialAuthPluginHandling(authPluginName: newPluginName, isTLS: state.isTLS, passwordInput: state.password, authPluginData: newAuthData, done: state.done)
+        let newHash = try doInitialAuthPluginHandling(authPluginName: newPluginName, isTLS: state.isTLS, passwordInput: state.password, authPluginData: newAuthData, allowPublicKeyRetrieval: state.allowPublicKeyRetrieval, done: state.done)
         // Send an AuthSwitchResponse (which is just the plugin auth data by itself)
         context.write(self.wrapOutboundOut(MySQLPacket(payload: newHash)), promise: nil)
         context.flush()
@@ -322,7 +330,7 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
                     name = pName
                     self.logger.trace("caching_sha2_password sent command \(pName)")
                 }
-                self.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: false, done: state.done)) // make sure to reset
+                self.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: false, allowPublicKeyRetrieval: state.allowPublicKeyRetrieval, done: state.done)) // make sure to reset
 
                 switch name {
                 case .none: // our internal sentinel for "here's the public key" for non-TLS connections
@@ -346,11 +354,21 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
                         // TLS connection, send password in the "clear"
                         self.logger.trace("caching_sha2_password sent perform_full_authentication on TLS, sending password in cleartext")
                         payload.writeNullTerminatedString(state.password ?? "")
-                    } else {
+                    } else if state.allowPublicKeyRetrieval {
                         // send a public key request and wait
                         self.logger.trace("caching_sha2_password sent perform_full_authentication on insecure, sending request_public_key")
                         payload.writeBytes([0x02])
-                        self.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: true, done: state.done))
+                        self.state = .authenticating(AuthenticationState(authPluginName: state.authPluginName, password: state.password, isTLS: state.isTLS, savedSeedValue: state.savedSeedValue, awaitingCachingSha2PluginPublicKey: true, allowPublicKeyRetrieval: state.allowPublicKeyRetrieval, done: state.done))
+                    } else {
+                        // An unauthenticated public key would let anyone on the path decrypt the password:
+                        // refuse, and close without writing anything else (no request_public_key, no COM_QUIT).
+                        self.logger.trace("caching_sha2_password sent perform_full_authentication on insecure, public key retrieval not allowed")
+                        // Close before failing the promise: its failure callback closes the channel through
+                        // this handler, which would write a COM_QUIT.
+                        self.state = .loginFailed
+                        context.close(mode: .all, promise: nil)
+                        state.done.fail(MySQLError.publicKeyRetrievalNotAllowed)
+                        return
                     }
                     context.writeAndFlush(self.wrapOutboundOut(MySQLPacket(payload: payload)), promise: nil)
                 default:
@@ -493,17 +511,33 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
     }
     
     func channelInactive(context: ChannelHandlerContext) {
+        // The server (or something on the path) closed the connection before the login finished.
+        self.failLogin(MySQLError.closed)
         while let next = self.queue.popLast() {
             next.promise.fail(MySQLError.closed)
+        }
+    }
+
+    /// Fails the connect promise once, if the login is still in progress, and leaves the login states.
+    func failLogin(_ error: any Error) {
+        switch self.state {
+        case .handshake(let state):
+            self.state = .loginFailed
+            state.done.fail(error)
+        case .authenticating(let state):
+            self.state = .loginFailed
+            state.done.fail(error)
+        case .commandPhase, .loginFailed:
+            break
         }
     }
     
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
         switch self.state {
-        case .handshake(let state):
-            state.done.fail(error)
-        case .authenticating(let state):
-            state.done.fail(error)
+        case .handshake, .authenticating:
+            self.failLogin(error)
+        case .loginFailed:
+            break
         case .commandPhase:
             if let current = self.queue.first {
                 self.queue.removeFirst()

@@ -7,7 +7,8 @@ import NIOPosix
 import NIOSSL
 import Testing
 
-/// Tests for the dblore fork patches (TLS downgrade refusal, caching_sha2 20-byte scramble).
+/// Tests for the dblore fork patches (TLS downgrade refusal, caching_sha2 20-byte scramble,
+/// no plain-text public key retrieval by default, failing the login when the channel closes).
 @Suite(.serialized)
 struct DblorePatchTests {
     init() {
@@ -72,7 +73,7 @@ struct DblorePatchTests {
         do {
             // First connect: fresh user, server cache is cold -> full auth via RSA over plain TCP.
             let first = LogCapture()
-            let c1 = try await Self.connect(port: port, user: user, password: password, database: database, tls: nil, logger: first.logger)
+            let c1 = try await Self.connect(port: port, user: user, password: password, database: database, tls: nil, allowPublicKeyRetrieval: true, logger: first.logger)
             let r1 = try await c1.simpleQuery("SELECT 1 AS one").get()
             try await c1.close().get()
             #expect(r1.first?.column("one")?.int == 1)
@@ -107,14 +108,165 @@ struct DblorePatchTests {
         #expect(rows.first?.column("one")?.int == 1)
     }
 
+    // MARK: - Patch C: no RSA public key retrieval over plain TCP unless allowed
+
+    @Test
+    func fullAuthWithoutTLSIsRefusedByDefault() throws {
+        let (channel, done) = try Self.authenticating(isTLS: false, allowPublicKeyRetrieval: false)
+
+        try channel.writeInbound(MySQLPacket(payload: Self.performFullAuthentication()))
+
+        #expect(try channel.readOutbound(as: MySQLPacket.self) == nil) // no request_public_key, no COM_QUIT
+        #expect(!channel.isActive)
+        #expect(Self.failure(of: done) as? MySQLError == .publicKeyRetrievalNotAllowed)
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func fullAuthWithoutTLSRequestsThePublicKeyWhenAllowed() throws {
+        let (channel, done) = try Self.authenticating(isTLS: false, allowPublicKeyRetrieval: true)
+
+        try channel.writeInbound(MySQLPacket(payload: Self.performFullAuthentication()))
+
+        let packet = try #require(try channel.readOutbound(as: MySQLPacket.self))
+        #expect(Array(buffer: packet.payload) == [0x02])
+        done.succeed(())
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func fullAuthOverTLSStillSendsThePassword() throws {
+        let (channel, done) = try Self.authenticating(isTLS: true, allowPublicKeyRetrieval: false)
+
+        try channel.writeInbound(MySQLPacket(payload: Self.performFullAuthentication()))
+
+        let packet = try #require(try channel.readOutbound(as: MySQLPacket.self))
+        #expect(Array(buffer: packet.payload) == Array("p".utf8) + [0])
+        done.succeed(())
+        _ = try? channel.finish()
+    }
+
+    // MARK: - Patch C: a channel that closes during the login fails the connect promise
+
+    @Test
+    func channelClosedDuringHandshakeFailsTheLogin() throws {
+        let channel = EmbeddedChannel()
+        let done = channel.eventLoop.makePromise(of: Void.self)
+        try channel.pipeline.syncOperations.addHandler(Self.handler(tls: nil, done: done))
+        channel.pipeline.fireChannelActive()
+
+        _ = try? channel.close().wait()
+
+        #expect(Self.failure(of: done) as? MySQLError == .closed)
+    }
+
+    @Test
+    func channelClosedDuringAuthenticationFailsTheLogin() throws {
+        let (channel, done) = try Self.authenticating(isTLS: false, allowPublicKeyRetrieval: true)
+
+        _ = try? channel.close().wait()
+
+        #expect(Self.failure(of: done) as? MySQLError == .closed)
+    }
+
+    @Test(.enabled(if: env("DBLORE_PATCH_INTEGRATION") != nil))
+    func cachingSha2PublicKeyRetrievalOverPlainTCP() async throws {
+        let user = "dblore_patch_rsa"
+        let password = "dblore-patch-rsa-pw"
+        let port = env("DBLORE_MYSQL_PORT").flatMap(Int.init) ?? 3307
+        let database = env("DBLORE_DATABASE") ?? "dblore_test"
+
+        let root = try await Self.connect(port: port, user: "root", password: env("DBLORE_ROOT_PASSWORD") ?? "dblore123", database: database, tls: Self.insecureTLS())
+        func cleanUp() async {
+            _ = try? await root.simpleQuery("DROP USER IF EXISTS '\(user)'@'%'").get()
+            try? await root.close().get()
+        }
+        do {
+            _ = try await root.simpleQuery("DROP USER IF EXISTS '\(user)'@'%'").get()
+            _ = try await root.simpleQuery("CREATE USER '\(user)'@'%' IDENTIFIED WITH caching_sha2_password BY '\(password)'").get()
+            _ = try await root.simpleQuery("GRANT SELECT ON `\(database)`.* TO '\(user)'@'%'").get()
+
+            // Cold cache, plain TCP, default: refused before any key request.
+            let refused = LogCapture()
+            do {
+                let c = try await Self.connect(port: port, user: user, password: password, database: database, tls: nil, logger: refused.logger)
+                try? await c.close().get()
+                Issue.record("plain-TCP full authentication succeeded without allowPublicKeyRetrieval")
+            } catch {
+                #expect(error as? MySQLError == .publicKeyRetrievalNotAllowed, "\(error)")
+            }
+            #expect(refused.contains("perform_full_authentication"))
+            #expect(!refused.contains("sending request_public_key"))
+
+            // Opted in: RSA full authentication works.
+            let allowed = try await Self.connect(port: port, user: user, password: password, database: database, tls: nil, allowPublicKeyRetrieval: true)
+            try await allowed.close().get()
+
+            // Cache cleared, then filled by a TLS login: plain TCP fast auth needs no flag.
+            _ = try await root.simpleQuery("FLUSH PRIVILEGES").get()
+            let tls = try await Self.connect(port: port, user: user, password: password, database: database, tls: Self.insecureTLS())
+            try await tls.close().get()
+            let fast = LogCapture()
+            let plain = try await Self.connect(port: port, user: user, password: password, database: database, tls: nil, logger: fast.logger)
+            let rows = try await plain.simpleQuery("SELECT 1 AS one").get()
+            try await plain.close().get()
+            #expect(rows.first?.column("one")?.int == 1)
+            #expect(fast.contains("fast_auth_success"))
+        } catch {
+            await cleanUp()
+            throw error
+        }
+        await cleanUp()
+    }
+
     // MARK: - Helpers
+
+    /// A handler past the HandshakeResponse41, waiting for the caching_sha2_password reply.
+    static func authenticating(
+        isTLS: Bool, allowPublicKeyRetrieval: Bool
+    ) throws -> (EmbeddedChannel, EventLoopPromise<Void>) {
+        let channel = EmbeddedChannel()
+        let done = channel.eventLoop.makePromise(of: Void.self)
+        let handler = MySQLConnectionHandler(
+            logger: .init(label: "test"),
+            state: .authenticating(.init(
+                authPluginName: "caching_sha2_password", password: "p", isTLS: isTLS,
+                savedSeedValue: Array(repeating: 0x41, count: 20),
+                awaitingCachingSha2PluginPublicKey: false,
+                allowPublicKeyRetrieval: allowPublicKeyRetrieval, done: done
+            )),
+            sequence: MySQLPacketSequence()
+        )
+        handler.serverCapabilities = [.CLIENT_PROTOCOL_41, .CLIENT_SECURE_CONNECTION, .CLIENT_PLUGIN_AUTH]
+        try channel.pipeline.syncOperations.addHandler(handler)
+        channel.pipeline.fireChannelActive()
+        return (channel, done)
+    }
+
+    /// AuthMoreData `perform_full_authentication` (0x01 0x04).
+    static func performFullAuthentication() -> ByteBuffer {
+        ByteBuffer(bytes: [0x01, 0x04])
+    }
+
+    /// The error of an already-failed promise; records an issue if it is pending or succeeded.
+    /// (EmbeddedEventLoop: never `wait()` on a pending promise, it would hang.)
+    static func failure(of promise: EventLoopPromise<Void>) -> (any Error)? {
+        let outcome = OutcomeBox()
+        promise.futureResult.whenComplete { outcome.value = $0 }
+        switch outcome.value {
+        case .failure(let error): return error
+        case .success: Issue.record("login unexpectedly succeeded")
+        case nil: Issue.record("login promise still pending")
+        }
+        return nil
+    }
 
     static func handler(tls: TLSConfiguration?, done: EventLoopPromise<Void>) -> MySQLConnectionHandler {
         MySQLConnectionHandler(
             logger: .init(label: "test"),
             state: .handshake(.init(
                 username: "u", database: "d", password: "p",
-                tlsConfiguration: tls, serverHostname: nil, done: done
+                tlsConfiguration: tls, serverHostname: nil, allowPublicKeyRetrieval: false, done: done
             )),
             sequence: MySQLPacketSequence()
         )
@@ -152,12 +304,13 @@ struct DblorePatchTests {
 
     static func connect(
         port: Int, user: String, password: String, database: String,
-        tls: TLSConfiguration?, logger: Logger = .init(label: "dblore.patch")
+        tls: TLSConfiguration?, allowPublicKeyRetrieval: Bool = false,
+        logger: Logger = .init(label: "dblore.patch")
     ) async throws -> MySQLConnection {
         let addr = try SocketAddress.makeAddressResolvingHost(env("DBLORE_HOST") ?? "127.0.0.1", port: port)
         return try await MySQLConnection.connect(
             to: addr, username: user, database: database, password: password,
-            tlsConfiguration: tls, logger: logger,
+            tlsConfiguration: tls, allowPublicKeyRetrieval: allowPublicKeyRetrieval, logger: logger,
             on: MultiThreadedEventLoopGroup.singletonMultiThreadedEventLoopGroup.any()
         ).get()
     }

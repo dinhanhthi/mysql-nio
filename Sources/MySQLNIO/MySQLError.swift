@@ -4,6 +4,9 @@ public enum MySQLError: Error, CustomStringConvertible, LocalizedError {
     case secureConnectionRequired
     /// A TLS configuration was supplied but the server's handshake does not advertise `CLIENT_SSL`.
     case tlsNotSupportedByServer
+    /// `caching_sha2_password` asked for full authentication over a connection without TLS and
+    /// `allowPublicKeyRetrieval` is false: fetching the server's RSA key in plain text is not safe.
+    case publicKeyRetrievalNotAllowed
     case unsupportedAuthPlugin(name: String)
     case authPluginDataError(name: String)
     case missingOrInvalidAuthMoreDataStatusTag
@@ -26,6 +29,8 @@ public enum MySQLError: Error, CustomStringConvertible, LocalizedError {
             return "A secure connection to the server is required for authentication."
         case .tlsNotSupportedByServer:
             return "TLS was requested but the server does not support it; refusing to continue without TLS."
+        case .publicKeyRetrievalNotAllowed:
+            return "The server requires full authentication over an unencrypted connection; enable TLS or allow public key retrieval."
         case .unsupportedAuthPlugin(let name):
             return "Unsupported auth plugin name: \(name)"
         case .authPluginDataError(let name):
