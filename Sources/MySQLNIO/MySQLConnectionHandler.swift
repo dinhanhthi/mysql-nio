@@ -162,7 +162,11 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
         let hash: ByteBuffer
         switch authPluginName {
         case "caching_sha2_password":
-            let seed = authPluginData
+            // The scramble is 20 bytes; servers send it followed by a NUL terminator which is not part of it.
+            var copy = authPluginData
+            guard let seed = copy.readSlice(length: 20) else {
+                throw MySQLError.authPluginDataError(name: authPluginName)
+            }
             hash = xor(sha256(password), sha256(sha256(sha256(password)), seed))
             saveSeed = seed.getBytes(at: 0, length: seed.readableBytes) ?? []
             self.logger.trace("Generated scrambled hash for caching_sha2_password")
