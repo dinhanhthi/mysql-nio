@@ -114,6 +114,10 @@ final class MySQLConnectionHandler: ChannelDuplexHandler {
             throw MySQLError.unsupportedServer(message: "Client protocol 4.1 required")
         }
         self.serverCapabilities = handshakeRequest.capabilities
+        // TLS was requested: never fall back to plaintext (and never send auth data) if the server can't do TLS.
+        guard state.tlsConfiguration == nil || handshakeRequest.capabilities.contains(.CLIENT_SSL) else {
+            throw MySQLError.tlsNotSupportedByServer
+        }
         if let tlsConfiguration = state.tlsConfiguration, handshakeRequest.capabilities.contains(.CLIENT_SSL) {
             var capabilities = MySQLProtocol.CapabilityFlags.clientDefault
             capabilities.insert(.CLIENT_SSL)

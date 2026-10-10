@@ -2,6 +2,8 @@ import Foundation
 
 public enum MySQLError: Error, CustomStringConvertible, LocalizedError {
     case secureConnectionRequired
+    /// A TLS configuration was supplied but the server's handshake does not advertise `CLIENT_SSL`.
+    case tlsNotSupportedByServer
     case unsupportedAuthPlugin(name: String)
     case authPluginDataError(name: String)
     case missingOrInvalidAuthMoreDataStatusTag
@@ -22,6 +24,8 @@ public enum MySQLError: Error, CustomStringConvertible, LocalizedError {
         switch self {
         case .secureConnectionRequired:
             return "A secure connection to the server is required for authentication."
+        case .tlsNotSupportedByServer:
+            return "TLS was requested but the server does not support it; refusing to continue without TLS."
         case .unsupportedAuthPlugin(let name):
             return "Unsupported auth plugin name: \(name)"
         case .authPluginDataError(let name):

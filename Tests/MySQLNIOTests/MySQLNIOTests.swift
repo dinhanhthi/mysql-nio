@@ -9,6 +9,7 @@ extension MySQLError: Equatable {
     public static func == (lhs: Self, rhs: Self) -> Bool {
         switch (lhs, rhs) {
         case (.secureConnectionRequired, .secureConnectionRequired): true
+        case (.tlsNotSupportedByServer, .tlsNotSupportedByServer): true
         case (.unsupportedAuthPlugin(let l), .unsupportedAuthPlugin(let r)) where l == r: true
         case (.authPluginDataError(let l), .authPluginDataError(let r)) where l == r: true
         case (.missingOrInvalidAuthMoreDataStatusTag, .missingOrInvalidAuthMoreDataStatusTag): true
