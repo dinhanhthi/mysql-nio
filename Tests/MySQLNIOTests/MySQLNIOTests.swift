@@ -20,6 +20,7 @@ extension MySQLError: Equatable {
         case (.protocolError, .protocolError): true
         case (.server(let l), .server(let r)) where l.errorCode == r.errorCode && l.sqlStateMarker == r.sqlStateMarker && l.sqlState == r.sqlState && l.errorMessage == r.errorMessage: true
         case (.closed, .closed): true
+        case (.packetTooLarge(let l), .packetTooLarge(let r)) where l == r: true
         case (.duplicateEntry(let l), .duplicateEntry(let r)) where l == r: true
         case (.invalidSyntax(let l), .invalidSyntax(let r)) where l == r: true
         default: false

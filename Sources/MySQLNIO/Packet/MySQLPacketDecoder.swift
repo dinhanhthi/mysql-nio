@@ -8,10 +8,21 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
     let logger: Logger
     /// The payload so far of a packet sent in several parts (each 0xFFFFFF bytes but the last).
     private var partial: ByteBuffer?
+    /// The longest payload accepted, continuations included.
+    let maxMessageLength: Int
+
+    /// 1 GiB, the most `max_allowed_packet` allows: a server never sends more, so a longer
+    /// message (endless continuations) is a broken or hostile peer, not data to buffer.
+    static let maxMessageLength = 1 << 30
     
     public init(sequence: MySQLPacketSequence, logger: Logger) {
+        self.init(sequence: sequence, logger: logger, maxMessageLength: Self.maxMessageLength)
+    }
+
+    init(sequence: MySQLPacketSequence, logger: Logger, maxMessageLength: Int) {
         self.sequence = sequence
         self.logger = logger
+        self.maxMessageLength = maxMessageLength
     }
     
     public mutating func decode(context: ChannelHandlerContext, buffer: inout ByteBuffer) throws -> DecodingState {
@@ -24,6 +35,11 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
         let length = header & 0x00_FF_FF_FF
         let sequenceID = header >> 24
         // print("header: \(header) length: \(length) seq: \(sequenceID)")
+        // Checked on the header, before waiting for (and buffering) the payload.
+        guard (self.partial?.readableBytes ?? 0) + Int(length) <= self.maxMessageLength else {
+            self.partial = nil
+            throw MySQLError.packetTooLarge(limit: self.maxMessageLength)
+        }
         guard var payload = copy.readSlice(length: numericCast(length)) else {
             return .needMoreData
         }

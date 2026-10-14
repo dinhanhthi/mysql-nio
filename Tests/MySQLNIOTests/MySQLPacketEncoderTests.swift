@@ -91,7 +91,8 @@ struct MySQLPacketEncoderTests {
 }
 
 /// Patch D: the decoder joins a 0xFFFFFF-byte packet with the packets that follow it, up to
-/// the first shorter one, into one `MySQLPacket`; the sequence follows the last packet.
+/// the first shorter one, into one `MySQLPacket`; the sequence follows the last packet. A
+/// message longer than the cap fails as soon as a header announces it.
 @Suite
 struct MySQLPacketDecoderTests {
     static let max = MySQLPacketEncoderTests.max
@@ -146,6 +147,47 @@ struct MySQLPacketDecoderTests {
         _ = try channel.finish()
     }
 
+    // MARK: - Size cap
+
+    @Test
+    func theDefaultCapIsOneGiB() {
+        #expect(MySQLPacketDecoder.maxMessageLength == 1 << 30)
+    }
+
+    @Test
+    func aHeaderOverTheCapFailsBeforeItsPayloadArrives() throws {
+        let channel = try Self.channel(MySQLPacketSequence(), maxMessageLength: 100)
+        // Only the header of a full-size packet: nothing of the payload is buffered.
+        #expect(throws: MySQLError.packetTooLarge(limit: 100)) {
+            try channel.writeInbound(ByteBuffer(bytes: [0xFF, 0xFF, 0xFF, 1]))
+        }
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func continuationsOverTheCapFail() throws {
+        let cap = Self.max + 5
+        let channel = try Self.channel(MySQLPacketSequence(), maxMessageLength: cap)
+        let payload = MySQLPacketEncoderTests.payload(size: Self.max + 6)
+        let wire = Self.wire(payload, lengths: [Self.max, 6], firstID: 1)
+        try channel.writeInbound(ByteBuffer(bytes: wire[..<(Self.max + 4)]))
+        // The next header would take the message past the cap.
+        #expect(throws: MySQLError.packetTooLarge(limit: cap)) {
+            try channel.writeInbound(ByteBuffer(bytes: wire[(Self.max + 4)..<(Self.max + 8)]))
+        }
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func aMessageOfExactlyTheCapIsAccepted() throws {
+        let cap = Self.max + 5
+        let channel = try Self.channel(MySQLPacketSequence(), maxMessageLength: cap)
+        let payload = MySQLPacketEncoderTests.payload(size: cap)
+        try channel.writeInbound(ByteBuffer(bytes: Self.wire(payload, lengths: [Self.max, 5], firstID: 1)))
+        #expect(Array(buffer: try #require(try channel.readInbound(as: MySQLPacket.self)).payload) == payload)
+        _ = try channel.finish()
+    }
+
     // MARK: - Helpers
 
     static func expectReassembled(size: Int, lengths: [Int]) throws {
@@ -160,10 +202,14 @@ struct MySQLPacketDecoderTests {
         _ = try channel.finish()
     }
 
-    static func channel(_ sequence: MySQLPacketSequence) throws -> EmbeddedChannel {
+    static func channel(
+        _ sequence: MySQLPacketSequence, maxMessageLength: Int = MySQLPacketDecoder.maxMessageLength
+    ) throws -> EmbeddedChannel {
         let channel = EmbeddedChannel()
         try channel.pipeline.syncOperations.addHandler(
-            ByteToMessageHandler(MySQLPacketDecoder(sequence: sequence, logger: .init(label: "test")))
+            ByteToMessageHandler(MySQLPacketDecoder(
+                sequence: sequence, logger: .init(label: "test"), maxMessageLength: maxMessageLength
+            ))
         )
         return channel
     }
