@@ -219,7 +219,86 @@ struct DblorePatchTests {
         await cleanUp()
     }
 
+    // MARK: - Patch E: connect(over:) logs in on a channel the caller opened
+
+    @Test
+    func connectOverInstallsThePipelineAndLogsIn() throws {
+        let channel = EmbeddedChannel()
+        let outcome = ConnectionBox()
+        MySQLConnection.connect(
+            over: channel, username: "u", database: "d", password: "p", tlsConfiguration: nil
+        ).whenComplete { outcome.value = $0 }
+        channel.embeddedEventLoop.run()
+
+        // Raw bytes in and out: the packet decoder and encoder are installed.
+        try channel.writeInbound(Self.wire(Self.handshakeV10WithoutSSL(), sequenceID: 0))
+        let response = try #require(try channel.readOutbound(as: ByteBuffer.self))
+        #expect(response.getInteger(at: 3, as: UInt8.self) == 1) // HandshakeResponse41, sequence id 1
+        #expect(outcome.value == nil)
+
+        try channel.writeInbound(Self.wire(ByteBuffer(bytes: [0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00]), sequenceID: 2))
+        guard case .success(let connection) = try #require(outcome.value) else {
+            Issue.record("login failed: \(String(describing: outcome.value))")
+            return
+        }
+        #expect(connection.channel === channel)
+        _ = try? channel.finish()
+    }
+
+    @Test
+    func connectOverClosesTheChannelWhenTheLoginFails() throws {
+        let channel = EmbeddedChannel()
+        try channel.connect(to: SocketAddress(ipAddress: "127.0.0.1", port: 1)).wait()
+        let outcome = ConnectionBox()
+        MySQLConnection.connect(
+            over: channel, username: "u", database: "d", password: "p",
+            tlsConfiguration: .makeClientConfiguration()
+        ).whenComplete { outcome.value = $0 }
+        channel.embeddedEventLoop.run()
+
+        // TLS requested, the server lacks CLIENT_SSL: the login fails and the channel closes.
+        _ = try? channel.writeInbound(Self.wire(Self.handshakeV10WithoutSSL(), sequenceID: 0))
+        channel.embeddedEventLoop.run()
+        guard case .failure(let error) = try #require(outcome.value) else {
+            Issue.record("login unexpectedly succeeded")
+            return
+        }
+        #expect(error as? MySQLError == .tlsNotSupportedByServer)
+        #expect(!channel.isActive)
+    }
+
+    @Test(.enabled(if: env("DBLORE_PATCH_INTEGRATION") != nil))
+    func connectOverATCPChannelWithTLS() async throws {
+        let port = env("DBLORE_MYSQL_PORT").flatMap(Int.init) ?? 3307
+        let address = try SocketAddress.makeAddressResolvingHost(env("DBLORE_HOST") ?? "127.0.0.1", port: port)
+        let channel = try await ClientBootstrap(group: MultiThreadedEventLoopGroup.singleton)
+            .connect(to: address).get()
+        let connection = try await MySQLConnection.connect(
+            over: channel, username: "root", database: env("DBLORE_DATABASE") ?? "dblore_test",
+            password: env("DBLORE_ROOT_PASSWORD") ?? "dblore123", tlsConfiguration: Self.insecureTLS(),
+            serverHostname: "localhost"
+        ).get()
+        do {
+            let rows = try await connection.simpleQuery("SHOW SESSION STATUS LIKE 'Ssl_cipher'").get()
+            #expect(rows.first?.column("Value")?.string?.isEmpty == false)
+        } catch {
+            try? await connection.close().get()
+            throw error
+        }
+        try await connection.close().get()
+    }
+
     // MARK: - Helpers
+
+    /// `payload` as one packet on the wire (3-byte length, sequence id).
+    static func wire(_ payload: ByteBuffer, sequenceID: UInt8) -> ByteBuffer {
+        var payload = payload
+        var buffer = ByteBuffer()
+        let length = payload.readableBytes
+        buffer.writeBytes([UInt8(length & 0xFF), UInt8(length >> 8 & 0xFF), UInt8(length >> 16 & 0xFF), sequenceID])
+        buffer.writeBuffer(&payload)
+        return buffer
+    }
 
     /// A handler past the HandshakeResponse41, waiting for the caching_sha2_password reply.
     static func authenticating(
@@ -319,6 +398,11 @@ struct DblorePatchTests {
 /// Holds a future's result; only touched on the EmbeddedEventLoop's (single) thread.
 final class OutcomeBox: @unchecked Sendable {
     var value: Result<Void, any Error>?
+}
+
+/// `OutcomeBox` for a connect future.
+final class ConnectionBox: @unchecked Sendable {
+    var value: Result<MySQLConnection, any Error>?
 }
 
 /// Captures log messages at `.trace` so tests can observe which auth path was taken.

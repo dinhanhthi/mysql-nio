@@ -21,38 +21,95 @@ public final class MySQLConnection: MySQLDatabase, Sendable {
         logger.debug("Opening new connection to \(socketAddress)")
         
         return bootstrap.connect(to: socketAddress).flatMap { channel in
-            let sequence = MySQLPacketSequence()
-            let done = channel.eventLoop.makePromise(of: Void.self)
-            done.futureResult.whenFailure { _ in
-                channel.close(mode: .all, promise: nil)
-            }
-            do {
-                try channel.pipeline.syncOperations.addHandlers([
-                    ByteToMessageHandler(MySQLPacketDecoder(
-                        sequence: sequence,
-                        logger: logger
-                    )),
-                    MessageToByteHandler(MySQLPacketEncoder(
-                        sequence: sequence,
-                        logger: logger
-                    )),
-                    MySQLConnectionHandler(logger: logger, state: .handshake(.init(
-                        username: username,
-                        database: database,
-                        password: password,
-                        tlsConfiguration: tlsConfiguration,
-                        serverHostname: serverHostname,
-                        allowPublicKeyRetrieval: allowPublicKeyRetrieval,
-                        done: done
-                    )), sequence: sequence),
-                    ErrorHandler()
-                ], position: .last)
-            } catch {
-                return channel.eventLoop.makeFailedFuture(error)
-            }
-
-            return done.futureResult.map { MySQLConnection(channel: channel, logger: logger) }
+            Self.startLogin(
+                on: channel,
+                username: username,
+                database: database,
+                password: password,
+                tlsConfiguration: tlsConfiguration,
+                serverHostname: serverHostname,
+                allowPublicKeyRetrieval: allowPublicKeyRetrieval,
+                logger: logger
+            )
         }
+    }
+
+    /// Logs in on a channel the caller already opened (an SSH `direct-tcpip` channel, for
+    /// instance), with the pipeline and handshake of `connect(to:)`. TLS, when configured, runs
+    /// inside `channel`, checked against `serverHostname`. The server sends its greeting first:
+    /// call this on `channel`'s event loop before the channel delivers any inbound data, or the
+    /// greeting is lost. A failed login closes `channel`.
+    public static func connect(
+        over channel: any Channel,
+        username: String,
+        database: String,
+        password: String? = nil,
+        tlsConfiguration: TLSConfiguration? = .makeClientConfiguration(),
+        serverHostname: String? = nil,
+        allowPublicKeyRetrieval: Bool = false,
+        logger: Logger = .init(label: "codes.vapor.mysql")
+    ) -> EventLoopFuture<MySQLConnection> {
+        let start: @Sendable () -> EventLoopFuture<MySQLConnection> = {
+            Self.startLogin(
+                on: channel,
+                username: username,
+                database: database,
+                password: password,
+                tlsConfiguration: tlsConfiguration,
+                serverHostname: serverHostname,
+                allowPublicKeyRetrieval: allowPublicKeyRetrieval,
+                logger: logger
+            )
+        }
+        if channel.eventLoop.inEventLoop {
+            return start()
+        }
+        return channel.eventLoop.flatSubmit(start)
+    }
+
+    /// Installs the packet codec and the connection handler on `channel` (on its event loop)
+    /// and completes once the login succeeds.
+    private static func startLogin(
+        on channel: any Channel,
+        username: String,
+        database: String,
+        password: String?,
+        tlsConfiguration: TLSConfiguration?,
+        serverHostname: String?,
+        allowPublicKeyRetrieval: Bool,
+        logger: Logger
+    ) -> EventLoopFuture<MySQLConnection> {
+        let sequence = MySQLPacketSequence()
+        let done = channel.eventLoop.makePromise(of: Void.self)
+        done.futureResult.whenFailure { _ in
+            channel.close(mode: .all, promise: nil)
+        }
+        do {
+            try channel.pipeline.syncOperations.addHandlers([
+                ByteToMessageHandler(MySQLPacketDecoder(
+                    sequence: sequence,
+                    logger: logger
+                )),
+                MessageToByteHandler(MySQLPacketEncoder(
+                    sequence: sequence,
+                    logger: logger
+                )),
+                MySQLConnectionHandler(logger: logger, state: .handshake(.init(
+                    username: username,
+                    database: database,
+                    password: password,
+                    tlsConfiguration: tlsConfiguration,
+                    serverHostname: serverHostname,
+                    allowPublicKeyRetrieval: allowPublicKeyRetrieval,
+                    done: done
+                )), sequence: sequence),
+                ErrorHandler()
+            ], position: .last)
+        } catch {
+            return channel.eventLoop.makeFailedFuture(error)
+        }
+
+        return done.futureResult.map { MySQLConnection(channel: channel, logger: logger) }
     }
     
     public let channel: any Channel
