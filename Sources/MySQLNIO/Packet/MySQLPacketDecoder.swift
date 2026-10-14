@@ -6,6 +6,8 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
 
     public let sequence: MySQLPacketSequence
     let logger: Logger
+    /// The payload so far of a packet sent in several parts (each 0xFFFFFF bytes but the last).
+    private var partial: ByteBuffer?
     
     public init(sequence: MySQLPacketSequence, logger: Logger) {
         self.sequence = sequence
@@ -22,13 +24,23 @@ public struct MySQLPacketDecoder: ByteToMessageDecoder {
         let length = header & 0x00_FF_FF_FF
         let sequenceID = header >> 24
         // print("header: \(header) length: \(length) seq: \(sequenceID)")
-        guard let payload = copy.readSlice(length: numericCast(length)) else {
+        guard var payload = copy.readSlice(length: numericCast(length)) else {
             return .needMoreData
         }
         buffer = copy
+        self.sequence.current = UInt8(sequenceID & 0xFF)
+        // A full-size packet continues in the next one; the first shorter packet ends it.
+        if length == MySQLPacketEncoder.maxPayloadLength {
+            self.partial.setOrWriteBuffer(&payload)
+            return .continue
+        }
+        if var partial = self.partial {
+            partial.writeBuffer(&payload)
+            payload = partial
+            self.partial = nil
+        }
         let packet = MySQLPacket(payload: payload)
         self.logger.trace("MySQLPacketDecoder.decode: \(packet)")
-        self.sequence.current = UInt8(sequenceID & 0xFF)
         context.fireChannelRead(self.wrapInboundOut(packet))
         return .continue
     }
